@@ -80,13 +80,32 @@ const UNIT_BAR_Y_EXTRA = 6;
 
 const WARRIOR_INITIAL_STATS = {
     health: 100,
-    attack: 10,
-    defense: 5,
+    attack: 30,
+    defense: 0,
     speed: 6,
     attackSpeed: 8,
     attackRange: WARRIOR_OVERLAP_THRESHOLD,
     blockChance: 0.2,
 };
+
+/** Max units per side (blue / red); enforced on spawn. */
+const MAX_UNITS_PER_SIDE = 10;
+
+/** Cooldown (ms) between warrior spawns per side. */
+const WARRIOR_SPAWN_COOLDOWN_MS = 1000;
+
+/** Corner warrior button UI: shared styles and layout. */
+const CORNER_BUTTON_UI = {
+    margin: 20,
+    avatarScale: 0.6,
+    avatarPressOffset: 8,
+    avatarRestYOffset: -3,
+    keyLabelMargin: 6,
+    keyLabelFontSize: "18px",
+    keyLabelColor: "#fff",
+    depthButton: 1000,
+    depthOverlay: 1001,
+} as const;
 
 export class Game extends Scene {
     private blueWarriorSpawnX = 0;
@@ -97,6 +116,19 @@ export class Game extends Scene {
     private redWarriorSpawnY = 0;
     private redCastleX = 0;
     private redWarriors: Phaser.GameObjects.Sprite[] = [];
+    private warriorAttackSfx?: Phaser.Sound.BaseSound;
+    private warriorAttack2Sfx?: Phaser.Sound.BaseSound;
+    private warriorDieSfx?: Phaser.Sound.BaseSound;
+    private warriorDamageSfx?: Phaser.Sound.BaseSound;
+    private warriorShieldSfx?: Phaser.Sound.BaseSound;
+    private blueUnitCountText?: Phaser.GameObjects.Text;
+    private redUnitCountText?: Phaser.GameObjects.Text;
+    private blueCooldownEnd = 0;
+    private redCooldownEnd = 0;
+    private blueCooldownOverlay?: Phaser.GameObjects.Graphics;
+    private redCooldownOverlay?: Phaser.GameObjects.Graphics;
+    private blueCornerButton?: Phaser.GameObjects.Image;
+    private redCornerButton?: Phaser.GameObjects.Image;
 
     constructor() {
         super("Game");
@@ -213,18 +245,191 @@ export class Game extends Scene {
         });
         // BGM
         this.load.audio("bgm", "1-10. Floral Life.mp3");
+        // Warrior SFX (paths relative to setPath("assets"))
+        this.load.audio("warrior_attack", "warrior_attack.mp3");
+        this.load.audio("warrior_attack2", "warrier_attack2.mp3");
+        this.load.audio("warrior_die", "warrior_die.mp3");
+        this.load.audio("warrior_shield", "warrior_shield.mp3");
+        this.load.audio("warrior_damage", "warrior_damage.mp3");
+        // Custom cursors (Cursor_01 = default arrow, Cursor_02 = pointer, Cursor_03 = forbidden)
+        this.load.image("cursor-01", "Cursor_01.png");
+        this.load.image("cursor-02", "Cursor_02.png");
+        this.load.image("cursor-03", "Cursor_03.png");
+        // Warrior avatars (UI sprites; not displayed yet)
+        this.load.image("blue-warrior-avatar", "blue_warrior_avatar.png");
+        this.load.image("red-warrior-avatar", "red_warrior_avatar.png");
+        // Small square buttons (regular + pressed for blue and red)
+        this.load.image(
+            "small-blue-button-regular",
+            "SmallBlueSquareButton_Regular.png",
+        );
+        this.load.image(
+            "small-blue-button-pressed",
+            "SmallBlueSquareButton_Pressed.png",
+        );
+        this.load.image(
+            "small-red-button-regular",
+            "SmallRedSquareButton_Regular.png",
+        );
+        this.load.image(
+            "small-red-button-pressed",
+            "SmallRedSquareButton_Pressed.png",
+        );
     }
 
     create() {
         const { width, height } = this.scale;
 
-        // BGM – loop
-        this.sound.add("bgm", { loop: true }).play();
-
-        // Layer 0: Water background (BG Color) – fills entire screen
+        // Layer 0: Water background first (depth 0) so game world renders on top
         const waterBg = this.add.image(width / 2, height / 2, "water-bg");
         waterBg.setDisplaySize(width, height);
         waterBg.setDepth(0);
+
+        // BGM – loop
+        this.sound.add("bgm", { loop: true }).play();
+
+        // Pre-add warrior SFX so first play doesn’t block (decode happens here)
+        this.warriorAttackSfx = this.sound.add("warrior_attack");
+        this.warriorAttack2Sfx = this.sound.add("warrior_attack2");
+        this.warriorDieSfx = this.sound.add("warrior_die");
+        this.warriorDamageSfx = this.sound.add("warrior_damage");
+        this.warriorShieldSfx = this.sound.add("warrior_shield");
+        (this.warriorShieldSfx as Phaser.Sound.HTML5AudioSound).setVolume(1.8);
+
+        // Custom default cursor (Cursor_01 – arrow). Hotspot 2,2 for pixel-art arrow tip.
+        const base =
+            typeof import.meta !== "undefined" &&
+            import.meta.env?.BASE_URL != null
+                ? import.meta.env.BASE_URL
+                : "/";
+        const assetsBase = base.replace(/\/$/, "");
+        const cursorUrl = `${assetsBase}/assets/Cursor_01.png`;
+        const cursorPointerUrl = `${assetsBase}/assets/Cursor_02.png`;
+        this.sys.game.canvas.style.cursor = `url("${cursorUrl}") 2 2, auto`;
+
+        const uiMargin = CORNER_BUTTON_UI.margin;
+        const uiDepthBtn = CORNER_BUTTON_UI.depthButton;
+        const uiDepthOverlay = CORNER_BUTTON_UI.depthOverlay;
+        const avatarScale = CORNER_BUTTON_UI.avatarScale;
+        const avatarPressOffset = CORNER_BUTTON_UI.avatarPressOffset;
+        const avatarRestYOff = CORNER_BUTTON_UI.avatarRestYOffset;
+        const keyLabelMargin = CORNER_BUTTON_UI.keyLabelMargin;
+        const keyLabelStyle = {
+            fontSize: CORNER_BUTTON_UI.keyLabelFontSize,
+            color: CORNER_BUTTON_UI.keyLabelColor,
+        };
+
+        const createCornerWarriorButton = (opts: {
+            side: "blue" | "red";
+            placement: "left" | "right";
+            buttonRegular: string;
+            buttonPressed: string;
+            avatarKey: string;
+            keyLabel: string;
+            keyCode: number;
+            onActivate?: () => void;
+        }) => {
+            const { side, placement, buttonRegular, buttonPressed, avatarKey, keyLabel, keyCode, onActivate } = opts;
+            const isLeft = placement === "left";
+            const btnX = isLeft ? uiMargin : width - uiMargin;
+            const btnY = uiMargin;
+
+            const button = this.add.image(btnX, btnY, buttonRegular);
+            button.setOrigin(isLeft ? 0 : 1, 0).setDepth(uiDepthBtn);
+            button.setInteractive({ useHandCursor: false });
+
+            if (side === "blue") this.blueCornerButton = button;
+            else this.redCornerButton = button;
+
+            const btnW = button.width;
+            const btnH = button.height;
+            const centerX = isLeft ? btnX + btnW / 2 : btnX - btnW / 2;
+            const avatarRestY = btnY + btnH / 2 + avatarRestYOff;
+            const avatarSize = Math.min(btnW, btnH) * avatarScale;
+
+            const avatar = this.add.image(centerX, avatarRestY, avatarKey);
+            avatar.setDisplaySize(avatarSize, avatarSize).setDepth(uiDepthOverlay);
+
+            const setPressed = (pressed: boolean) => {
+                button.setTexture(pressed ? buttonPressed : buttonRegular);
+                avatar.y = pressed ? avatarRestY + avatarPressOffset : avatarRestY;
+            };
+
+            const isOnCooldown = () => {
+                const end = side === "blue" ? this.blueCooldownEnd : this.redCooldownEnd;
+                return this.time.now < end;
+            };
+
+            const cooldownOverlay = this.add.graphics();
+            cooldownOverlay.setDepth(uiDepthOverlay + 0.5);
+            cooldownOverlay.setMask(button.createBitmapMask());
+            if (side === "blue") this.blueCooldownOverlay = cooldownOverlay;
+            else this.redCooldownOverlay = cooldownOverlay;
+
+            button.on("pointerover", () => {
+                this.sys.game.canvas.style.cursor = `url("${cursorPointerUrl}") 2 2, auto`;
+            });
+            button.on("pointerout", () => {
+                this.sys.game.canvas.style.cursor = `url("${cursorUrl}") 2 2, auto`;
+                setPressed(false);
+            });
+            button.on("pointerdown", () => {
+                if (!isOnCooldown()) setPressed(true);
+            });
+            button.on("pointerup", () => {
+                setPressed(false);
+                if (!isOnCooldown()) onActivate?.();
+            });
+
+            const labelX = isLeft ? btnX + btnW - keyLabelMargin : btnX - keyLabelMargin;
+            const labelY = btnY + btnH - keyLabelMargin;
+            const keyLabelText = this.add.text(labelX, labelY, keyLabel, keyLabelStyle);
+            keyLabelText.setOrigin(1, 1).setDepth(uiDepthOverlay);
+
+            const keyObj = this.input.keyboard?.addKey(keyCode);
+            if (keyObj) {
+                keyObj.on("down", () => {
+                    if (!isOnCooldown()) setPressed(true);
+                });
+                keyObj.on("up", () => {
+                    setPressed(false);
+                    if (!isOnCooldown()) onActivate?.();
+                });
+            }
+        };
+
+        createCornerWarriorButton({
+            side: "blue",
+            placement: "left",
+            buttonRegular: "small-blue-button-regular",
+            buttonPressed: "small-blue-button-pressed",
+            avatarKey: "blue-warrior-avatar",
+            keyLabel: "Q",
+            keyCode: Phaser.Input.Keyboard.KeyCodes.Q,
+            onActivate: () => this.trySpawnBlue(),
+        });
+        createCornerWarriorButton({
+            side: "red",
+            placement: "right",
+            buttonRegular: "small-red-button-regular",
+            buttonPressed: "small-red-button-pressed",
+            avatarKey: "red-warrior-avatar",
+            keyLabel: "P",
+            keyCode: Phaser.Input.Keyboard.KeyCodes.P,
+            onActivate: () => this.trySpawnRed(),
+        });
+
+        // Unit count display below avatar buttons (blue left, red right; "n / 10")
+        const cornerBtnH = this.blueCornerButton!.height;
+        const unitCountY = uiMargin + cornerBtnH + 12;
+        const unitCountStyle = { fontSize: "18px", color: "#fff" };
+        const blueCountX = uiMargin + this.blueCornerButton!.width / 2;
+        const redCountX = width - uiMargin - this.redCornerButton!.width / 2;
+        this.blueUnitCountText = this.add.text(blueCountX, unitCountY, "0 / 10", unitCountStyle);
+        this.blueUnitCountText.setOrigin(0.5, 0).setDepth(uiDepthOverlay);
+        this.redUnitCountText = this.add.text(redCountX, unitCountY, "0 / 10", unitCountStyle);
+        this.redUnitCountText.setOrigin(0.5, 0).setDepth(uiDepthOverlay);
+        this.updateUnitCountDisplay();
 
         const tileDisplaySize = TILE_SIZE * TILE_DISPLAY_SCALE;
         const startX =
@@ -455,26 +660,7 @@ export class Game extends Scene {
         // blueWarrior.setScale(TILE_DISPLAY_SCALE).setDepth(6);
         // blueWarrior.play("blue-warrior-idle", true);
 
-        this.input.keyboard?.on("keydown-Q", () => {
-            const w = this.add.sprite(
-                this.blueWarriorSpawnX,
-                this.blueWarriorSpawnY,
-                "blue-warrior-run",
-            );
-            w.setScale(TILE_DISPLAY_SCALE).setDepth(6);
-            w.setData("state", WARRIOR_STATE_RUNNING);
-            w.setData("faction", "blue");
-            w.setData("health", WARRIOR_INITIAL_STATS.health);
-            w.setData("maxHealth", WARRIOR_INITIAL_STATS.health);
-            w.setData("attack", WARRIOR_INITIAL_STATS.attack);
-            w.setData("defense", WARRIOR_INITIAL_STATS.defense);
-            w.setData("attackSpeed", WARRIOR_INITIAL_STATS.attackSpeed);
-            w.setData("blockChance", WARRIOR_INITIAL_STATS.blockChance);
-            w.on("animationcomplete", this.onWarriorAttackComplete, this);
-            w.play("blue-warrior-run", true);
-            this.createUnitHealthBar(w);
-            this.blueWarriors.push(w);
-        });
+        this.input.keyboard?.on("keydown-Q", () => this.trySpawnBlue());
 
         const redCastle = this.add.image(
             startX + 18 * tileDisplaySize,
@@ -550,26 +736,7 @@ export class Game extends Scene {
         //     .setFlipX(true);
         // redWarrior.play("red-warrior-idle", true);
 
-        this.input.keyboard?.on("keydown-P", () => {
-            const w = this.add.sprite(
-                this.redWarriorSpawnX,
-                this.redWarriorSpawnY,
-                "red-warrior-run",
-            );
-            w.setScale(TILE_DISPLAY_SCALE).setDepth(6).setFlipX(true);
-            w.setData("state", WARRIOR_STATE_RUNNING);
-            w.setData("faction", "red");
-            w.setData("health", WARRIOR_INITIAL_STATS.health);
-            w.setData("maxHealth", WARRIOR_INITIAL_STATS.health);
-            w.setData("attack", WARRIOR_INITIAL_STATS.attack);
-            w.setData("defense", WARRIOR_INITIAL_STATS.defense);
-            w.setData("attackSpeed", WARRIOR_INITIAL_STATS.attackSpeed);
-            w.setData("blockChance", WARRIOR_INITIAL_STATS.blockChance);
-            w.on("animationcomplete", this.onWarriorAttackComplete, this);
-            w.play("red-warrior-run", true);
-            this.createUnitHealthBar(w);
-            this.redWarriors.push(w);
-        });
+        this.input.keyboard?.on("keydown-P", () => this.trySpawnRed());
 
         EventBus.emit("current-scene-ready", this);
     }
@@ -701,6 +868,7 @@ export class Game extends Scene {
     private playGuardBlockAndRestore(
         defender: Phaser.GameObjects.Sprite,
     ): void {
+        this.warriorShieldSfx?.play();
         const faction = defender.getData("faction") as string;
         const guardKey =
             faction === "blue"
@@ -740,6 +908,7 @@ export class Game extends Scene {
             (target.getData("defense") as number) ??
             WARRIOR_INITIAL_STATS.defense;
         const damage = Math.max(0, attack - defense);
+        if (damage > 0) this.warriorDamageSfx?.play();
         const health =
             (target.getData("health") as number) ??
             WARRIOR_INITIAL_STATS.health;
@@ -749,8 +918,70 @@ export class Game extends Scene {
         if (newHealth <= 0) this.removeWarrior(target);
     }
 
+    /** Try to spawn a blue warrior (respects cap and cooldown). Used by Q key and blue corner button. */
+    private trySpawnBlue(): void {
+        if (this.blueWarriors.length >= MAX_UNITS_PER_SIDE) return;
+        const now = this.time.now;
+        if (now < this.blueCooldownEnd) return;
+        this.blueCooldownEnd = now + WARRIOR_SPAWN_COOLDOWN_MS;
+        const w = this.add.sprite(
+            this.blueWarriorSpawnX,
+            this.blueWarriorSpawnY,
+            "blue-warrior-run",
+        );
+        w.setScale(TILE_DISPLAY_SCALE).setDepth(6);
+        w.setData("state", WARRIOR_STATE_RUNNING);
+        w.setData("faction", "blue");
+        w.setData("health", WARRIOR_INITIAL_STATS.health);
+        w.setData("maxHealth", WARRIOR_INITIAL_STATS.health);
+        w.setData("attack", WARRIOR_INITIAL_STATS.attack);
+        w.setData("defense", WARRIOR_INITIAL_STATS.defense);
+        w.setData("attackSpeed", WARRIOR_INITIAL_STATS.attackSpeed);
+        w.setData("blockChance", WARRIOR_INITIAL_STATS.blockChance);
+        w.on("animationcomplete", this.onWarriorAttackComplete, this);
+        w.play("blue-warrior-run", true);
+        this.createUnitHealthBar(w);
+        this.blueWarriors.push(w);
+        this.updateUnitCountDisplay();
+    }
+
+    /** Try to spawn a red warrior (respects cap and cooldown). Used by P key and red corner button. */
+    private trySpawnRed(): void {
+        if (this.redWarriors.length >= MAX_UNITS_PER_SIDE) return;
+        const now = this.time.now;
+        if (now < this.redCooldownEnd) return;
+        this.redCooldownEnd = now + WARRIOR_SPAWN_COOLDOWN_MS;
+        const w = this.add.sprite(
+            this.redWarriorSpawnX,
+            this.redWarriorSpawnY,
+            "red-warrior-run",
+        );
+        w.setScale(TILE_DISPLAY_SCALE).setDepth(6).setFlipX(true);
+        w.setData("state", WARRIOR_STATE_RUNNING);
+        w.setData("faction", "red");
+        w.setData("health", WARRIOR_INITIAL_STATS.health);
+        w.setData("maxHealth", WARRIOR_INITIAL_STATS.health);
+        w.setData("attack", WARRIOR_INITIAL_STATS.attack);
+        w.setData("defense", WARRIOR_INITIAL_STATS.defense);
+        w.setData("attackSpeed", WARRIOR_INITIAL_STATS.attackSpeed);
+        w.setData("blockChance", WARRIOR_INITIAL_STATS.blockChance);
+        w.on("animationcomplete", this.onWarriorAttackComplete, this);
+        w.play("red-warrior-run", true);
+        this.createUnitHealthBar(w);
+        this.redWarriors.push(w);
+        this.updateUnitCountDisplay();
+    }
+
+    /** Update top unit count display (blue left, red right; format "n / 10"). */
+    private updateUnitCountDisplay(): void {
+        const max = MAX_UNITS_PER_SIDE;
+        this.blueUnitCountText?.setText(`${this.blueWarriors.length} / ${max}`);
+        this.redUnitCountText?.setText(`${this.redWarriors.length} / ${max}`);
+    }
+
     /** Remove warrior from game: play dust effect, destroy health bar, sprite, and remove from array. */
     private removeWarrior(warrior: Phaser.GameObjects.Sprite): void {
+        this.warriorDieSfx?.play();
         this.spawnDustEffect(warrior.x, warrior.y);
         const bar = warrior.getData("healthBar") as
             | {
@@ -771,6 +1002,7 @@ export class Game extends Scene {
         const idx = list.indexOf(warrior);
         if (idx !== -1) list.splice(idx, 1);
         warrior.destroy();
+        this.updateUnitCountDisplay();
     }
 
     /** True when warrior is within attack range of the enemy castle (so they should attack it). */
@@ -848,6 +1080,9 @@ export class Game extends Scene {
         const w = sprite as Phaser.GameObjects.Sprite;
         if (w.getData("state") !== WARRIOR_STATE_ATTACKING) return;
         if (!this.hasAttackTarget(w, WARRIOR_INITIAL_STATS.attackRange)) return;
+        const variant = w.getData("attackVariant") as 1 | 2;
+        if (variant === 1) this.warriorAttackSfx?.play();
+        else this.warriorAttack2Sfx?.play();
         const target = this.getClosestEnemyInRange(
             w,
             WARRIOR_INITIAL_STATS.attackRange,
@@ -858,6 +1093,39 @@ export class Game extends Scene {
     }
 
     update(_time: number, delta: number) {
+        const now = this.time.now;
+        const drawCooldownOverlay = (
+            overlay: Phaser.GameObjects.Graphics | undefined,
+            button: Phaser.GameObjects.Image | undefined,
+            cooldownEnd: number,
+            isLeft: boolean,
+        ) => {
+            if (!overlay || !button) return;
+            overlay.clear();
+            const remaining = cooldownEnd - now;
+            if (remaining <= 0) return;
+            const frac = Math.min(1, remaining / WARRIOR_SPAWN_COOLDOWN_MS);
+            const w = button.width;
+            const h = button.height;
+            const left = isLeft ? button.x : button.x - w;
+            const fillH = h * frac;
+            const top = button.y + h - fillH;
+            overlay.fillStyle(0x000000, 0.5);
+            overlay.fillRect(left, top, w, fillH);
+        };
+        drawCooldownOverlay(
+            this.blueCooldownOverlay,
+            this.blueCornerButton,
+            this.blueCooldownEnd,
+            true,
+        );
+        drawCooldownOverlay(
+            this.redCooldownOverlay,
+            this.redCornerButton,
+            this.redCooldownEnd,
+            false,
+        );
+
         const blueMove = (BLUE_WARRIOR_RUN_SPEED * delta) / 1000;
         for (const w of this.blueWarriors) {
             if (!w.active) continue;
