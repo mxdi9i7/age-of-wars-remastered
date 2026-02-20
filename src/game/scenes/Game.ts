@@ -53,9 +53,15 @@ const WARRIOR_OVERLAP_THRESHOLD = WARRIOR_FRAME_WIDTH / 5;
 const WARRIOR_STATE_RUNNING = "running";
 const WARRIOR_STATE_IDLE = "idle";
 const WARRIOR_STATE_ATTACKING = "attacking";
+const WARRIOR_STATE_BLOCKING = "blocking";
 /** Random delay (ms) before attack animation starts – min/max for variety. */
 const ATTACK_START_DELAY_MS_MIN = 0;
 const ATTACK_START_DELAY_MS_MAX = 400;
+
+/** Dust impact effect: 512×64 strip, 8 frames → 64×64 per frame. */
+const DUST_FRAME_WIDTH = 64;
+const DUST_FRAME_HEIGHT = 64;
+const DUST_FRAME_COUNT = 8;
 
 /** Small health bar: base 320×64 (3 frames: left, middle, right), fill 64×64. */
 const SMALL_BAR_BASE_WIDTH = 64;
@@ -79,6 +85,7 @@ const WARRIOR_INITIAL_STATS = {
     speed: 6,
     attackSpeed: 8,
     attackRange: WARRIOR_OVERLAP_THRESHOLD,
+    blockChance: 0.2,
 };
 
 export class Game extends Scene {
@@ -199,6 +206,11 @@ export class Game extends Scene {
             frameWidth: SMALL_BAR_BASE_WIDTH,
             frameHeight: SMALL_BAR_BASE_HEIGHT,
         });
+        // Dust impact effect (8 frames, play once)
+        this.load.spritesheet("dust", "Dust_01.png", {
+            frameWidth: DUST_FRAME_WIDTH,
+            frameHeight: DUST_FRAME_HEIGHT,
+        });
         // BGM
         this.load.audio("bgm", "1-10. Floral Life.mp3");
     }
@@ -236,6 +248,17 @@ export class Game extends Scene {
                 }),
                 frameRate: 10,
                 repeat: -1,
+            });
+        }
+        if (!this.anims.exists("dust")) {
+            this.anims.create({
+                key: "dust",
+                frames: this.anims.generateFrameNumbers("dust", {
+                    start: 0,
+                    end: DUST_FRAME_COUNT - 1,
+                }),
+                frameRate: 14,
+                repeat: 0,
             });
         }
         const foamDisplayScale =
@@ -397,6 +420,15 @@ export class Game extends Scene {
                 repeat: -1,
             });
             this.anims.create({
+                key: "blue-warrior-guard-block",
+                frames: this.anims.generateFrameNumbers(
+                    "blue-warrior-guard",
+                    {},
+                ),
+                frameRate: WARRIOR_INITIAL_STATS.attackSpeed,
+                repeat: 0,
+            });
+            this.anims.create({
                 key: "blue-warrior-attack1",
                 frames: this.anims.generateFrameNumbers(
                     "blue-warrior-attack1",
@@ -437,6 +469,7 @@ export class Game extends Scene {
             w.setData("attack", WARRIOR_INITIAL_STATS.attack);
             w.setData("defense", WARRIOR_INITIAL_STATS.defense);
             w.setData("attackSpeed", WARRIOR_INITIAL_STATS.attackSpeed);
+            w.setData("blockChance", WARRIOR_INITIAL_STATS.blockChance);
             w.on("animationcomplete", this.onWarriorAttackComplete, this);
             w.play("blue-warrior-run", true);
             this.createUnitHealthBar(w);
@@ -477,6 +510,15 @@ export class Game extends Scene {
                 ),
                 frameRate: WARRIOR_INITIAL_STATS.attackSpeed,
                 repeat: -1,
+            });
+            this.anims.create({
+                key: "red-warrior-guard-block",
+                frames: this.anims.generateFrameNumbers(
+                    "red-warrior-guard",
+                    {},
+                ),
+                frameRate: WARRIOR_INITIAL_STATS.attackSpeed,
+                repeat: 0,
             });
             this.anims.create({
                 key: "red-warrior-attack1",
@@ -522,6 +564,7 @@ export class Game extends Scene {
             w.setData("attack", WARRIOR_INITIAL_STATS.attack);
             w.setData("defense", WARRIOR_INITIAL_STATS.defense);
             w.setData("attackSpeed", WARRIOR_INITIAL_STATS.attackSpeed);
+            w.setData("blockChance", WARRIOR_INITIAL_STATS.blockChance);
             w.on("animationcomplete", this.onWarriorAttackComplete, this);
             w.play("red-warrior-run", true);
             this.createUnitHealthBar(w);
@@ -654,11 +697,42 @@ export class Game extends Scene {
         );
     }
 
-    /** Apply one hit from attacker to target: damage = attack - defense (min 0), at attack-speed rate (one hit per animation). */
+    /** Play guard (block) animation on defender once; on complete, restore to idle. */
+    private playGuardBlockAndRestore(
+        defender: Phaser.GameObjects.Sprite,
+    ): void {
+        const faction = defender.getData("faction") as string;
+        const guardKey =
+            faction === "blue"
+                ? "blue-warrior-guard-block"
+                : "red-warrior-guard-block";
+        const idleKey =
+            faction === "blue" ? "blue-warrior-idle" : "red-warrior-idle";
+        defender.setData("state", WARRIOR_STATE_BLOCKING);
+        defender.setTexture(guardKey, 0);
+        defender.play(guardKey);
+        defender.once("animationcomplete", () => {
+            if (!defender.active) return;
+            defender.setData("state", WARRIOR_STATE_IDLE);
+            defender.setTexture(idleKey, 0);
+            defender.play(idleKey, true);
+        });
+    }
+
+    /** Apply one hit from attacker to target: no damage while guarding; 50% block chance (guard animation), else damage = attack - defense (min 0). */
     private applyDamageToUnit(
         attacker: Phaser.GameObjects.Sprite,
         target: Phaser.GameObjects.Sprite,
     ): void {
+        if ((target.getData("state") as string) === WARRIOR_STATE_BLOCKING)
+            return;
+        const blockChance =
+            (target.getData("blockChance") as number) ??
+            WARRIOR_INITIAL_STATS.blockChance;
+        if (Phaser.Math.FloatBetween(0, 1) < blockChance) {
+            this.playGuardBlockAndRestore(target);
+            return;
+        }
         const attack =
             (attacker.getData("attack") as number) ??
             WARRIOR_INITIAL_STATS.attack;
@@ -675,8 +749,9 @@ export class Game extends Scene {
         if (newHealth <= 0) this.removeWarrior(target);
     }
 
-    /** Remove warrior from game: destroy health bar, sprite, and remove from array. */
+    /** Remove warrior from game: play dust effect, destroy health bar, sprite, and remove from array. */
     private removeWarrior(warrior: Phaser.GameObjects.Sprite): void {
+        this.spawnDustEffect(warrior.x, warrior.y);
         const bar = warrior.getData("healthBar") as
             | {
                   left: Phaser.GameObjects.Image;
@@ -755,6 +830,15 @@ export class Game extends Scene {
         w.setData("state", WARRIOR_STATE_ATTACKING);
     }
 
+    /** Spawn a one-shot dust effect at (x, y) (e.g. on unit destroy); sprite is destroyed when the animation completes. */
+    private spawnDustEffect(x: number, y: number): void {
+        const dust = this.add.sprite(x, y, "dust");
+        const dustScale = (TILE_SIZE * TILE_DISPLAY_SCALE) / DUST_FRAME_WIDTH;
+        dust.setScale(dustScale).setDepth(7);
+        dust.play("dust");
+        dust.once("animationcomplete", () => dust.destroy());
+    }
+
     /** On attack animation complete: apply damage to closest enemy in range (attack - defense, at attack-speed rate), then loop attack. */
     private onWarriorAttackComplete(
         _anim: Phaser.Animations.Animation,
@@ -778,6 +862,8 @@ export class Game extends Scene {
         for (const w of this.blueWarriors) {
             if (!w.active) continue;
             const state = w.getData("state") as string;
+
+            if (state === WARRIOR_STATE_BLOCKING) continue;
 
             if (state === WARRIOR_STATE_ATTACKING) {
                 if (
@@ -869,6 +955,8 @@ export class Game extends Scene {
         for (const w of this.redWarriors) {
             if (!w.active) continue;
             const state = w.getData("state") as string;
+
+            if (state === WARRIOR_STATE_BLOCKING) continue;
 
             if (state === WARRIOR_STATE_ATTACKING) {
                 if (

@@ -1,0 +1,9 @@
+---
+description: When to commit and push; do not do it automatically unless explicitly asked
+alwaysApply: true
+---
+
+# Git commit and push
+
+- Do **not** commit and push to GitHub at the end of your actions.
+- When the user **explicitly** asks you to commit and push (e.g. "commit and push", "commit and push these changes"), then do it: run the appropriate git commands to commit and push.
